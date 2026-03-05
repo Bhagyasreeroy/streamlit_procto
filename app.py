@@ -5,6 +5,7 @@ from datetime import datetime
 import time
 import pandas as pd
 from collections import deque
+from PIL import Image
 
 # ─── Page Config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -291,96 +292,78 @@ log_ph = st.empty()
 
 # ─── Monitoring Loop ────────────────────────────────────────────────────────────
 if st.session_state.monitoring:
-    cap = cv2.VideoCapture(0)
-
-    if not cap.isOpened():
-        st.error("❌ Could not open webcam. Make sure it is connected and not in use by another app.")
-        st.session_state.monitoring = False
-        st.stop()
-
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-
-    frame_delay = 1.0 / cfg["fps_limit"]
-    prev_time   = time.time()
-
-    try:
-        while st.session_state.monitoring:
-            ret, frame = cap.read()
-            if not ret:
-                st.warning("⚠️ Frame capture failed.")
-                break
-
-            now = time.time()
-            elapsed = now - prev_time
-            if elapsed < frame_delay:
-                time.sleep(frame_delay - elapsed)
-            fps_actual = 1.0 / max(time.time() - prev_time, 1e-6)
-            prev_time  = time.time()
-
-            annotated, events, face_count = analyze_frame(frame.copy(), cfg)
-
-            if cfg["show_raw"]:
-                gray_disp = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                annotated = cv2.cvtColor(gray_disp, cv2.COLOR_GRAY2BGR)
-
-            annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-            video_placeholder.image(annotated_rgb, channels="RGB", width="stretch")
-
-            # Update stats
-            st.session_state.stats["frames_processed"] += 1
-            st.session_state.stats["faces_detected"] = face_count
-            # Log events — with per-type cooldown to avoid spam
-            ts = datetime.now().strftime("%H:%M:%S")
-            now_t = time.time()
-            cooldown = cfg["cooldown"]
-            for sev, msg in events:
-                # Use first 30 chars of message as the key (ignores dynamic numbers)
-                key = msg[:30]
-                last = st.session_state.last_alert_time.get(key, 0)
-                if now_t - last >= cooldown:
-                    st.session_state.last_alert_time[key] = now_t
-                    st.session_state.alerts.appendleft({"time": ts, "severity": sev, "msg": msg})
-                    st.session_state.log.appendleft(f"[{ts}] [{sev}] {msg}")
-                    st.session_state.stats["violations"] += 1
-
-            # ── Metrics ──────────────────────────────────────────────────────
-            faces_ph.markdown(f"""
+    with col_vid:
+        camera_image = st.camera_input("📹 Take a picture for analysis")
+    
+    if camera_image is not None:
+        # Convert image to OpenCV format
+        img = Image.open(camera_image)
+        frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        
+        # Analyze frame
+        annotated, events, face_count = analyze_frame(frame.copy(), cfg)
+        
+        if cfg["show_raw"]:
+            gray_disp = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            annotated = cv2.cvtColor(gray_disp, cv2.COLOR_GRAY2BGR)
+        
+        annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+        video_placeholder.image(annotated_rgb, channels="RGB", use_column_width=True)
+        
+        # Update stats
+        st.session_state.stats["frames_processed"] += 1
+        st.session_state.stats["faces_detected"] = face_count
+        
+        # Log events — with per-type cooldown to avoid spam
+        ts = datetime.now().strftime("%H:%M:%S")
+        now_t = time.time()
+        cooldown = cfg["cooldown"]
+        for sev, msg in events:
+            # Use first 30 chars of message as the key (ignores dynamic numbers)
+            key = msg[:30]
+            last = st.session_state.last_alert_time.get(key, 0)
+            if now_t - last >= cooldown:
+                st.session_state.last_alert_time[key] = now_t
+                st.session_state.alerts.appendleft({"time": ts, "severity": sev, "msg": msg})
+                st.session_state.log.appendleft(f"[{ts}] [{sev}] {msg}")
+                st.session_state.stats["violations"] += 1
+        
+        # ── Metrics ──────────────────────────────────────────────────────
+        faces_ph.markdown(f"""
             <div class='metric-card'>
                 <div class='metric-value'>{face_count}</div>
                 <div class='metric-label'>Faces</div>
             </div>""", unsafe_allow_html=True)
-
-            violations_ph.markdown(f"""
+        
+        violations_ph.markdown(f"""
             <div class='metric-card'>
                 <div class='metric-value' style='color:#ef4444'>{st.session_state.stats['violations']}</div>
                 <div class='metric-label'>Violations</div>
             </div>""", unsafe_allow_html=True)
-
-            fps_ph.markdown(f"""
+        
+        fps_ph.markdown(f"""
             <div class='metric-card'>
-                <div class='metric-value' style='color:#a78bfa'>{fps_actual:.0f}</div>
+                <div class='metric-value' style='color:#a78bfa'>—</div>
                 <div class='metric-label'>FPS</div>
             </div>""", unsafe_allow_html=True)
-
-            # ── Alerts panel ─────────────────────────────────────────────────
-            alerts_html = ""
-            for a in list(st.session_state.alerts)[:10]:
-                css = "alert-high" if a["severity"] == "HIGH" else ("alert-med" if a["severity"] == "MED" else "alert-low")
-                alerts_html += f"<div class='alert-box {css}'><b>{a['time']}</b>  {a['msg']}</div>"
-            if not alerts_html:
-                alerts_html = "<div style='color:#475569;font-size:.8rem;padding:8px'>No alerts yet...</div>"
-            alerts_ph.markdown(alerts_html, unsafe_allow_html=True)
-
-            # ── Log ───────────────────────────────────────────────────────────
-            log_entries = "".join(
-                f"<div class='log-entry'><span>{e.split(']')[0][1:]}</span>{']'.join(e.split(']')[1:])}</div>"
-                for e in list(st.session_state.log)[:40]
-            )
-            log_ph.markdown(f"<div class='log-container'>{log_entries or '<span style=color:#334155>Awaiting events...</span>'}</div>", unsafe_allow_html=True)
-
-    finally:
-        cap.release()
+        
+        # ── Alerts panel ─────────────────────────────────────────────────
+        alerts_html = ""
+        for a in list(st.session_state.alerts)[:10]:
+            css = "alert-high" if a["severity"] == "HIGH" else ("alert-med" if a["severity"] == "MED" else "alert-low")
+            alerts_html += f"<div class='alert-box {css}'><b>{a['time']}</b>  {a['msg']}</div>"
+        if not alerts_html:
+            alerts_html = "<div style='color:#475569;font-size:.8rem;padding:8px'>No alerts yet...</div>"
+        alerts_ph.markdown(alerts_html, unsafe_allow_html=True)
+        
+        # ── Log ───────────────────────────────────────────────────────────
+        log_entries = "".join(
+            f"<div class='log-entry'><span>{e.split(']')[0][1:]}</span>{']'.join(e.split(']')[1:])}</div>"
+            for e in list(st.session_state.log)[:40]
+        )
+        log_ph.markdown(f"<div class='log-container'>{log_entries or '<span style=color:#334155>Awaiting events...</span>'}</div>", unsafe_allow_html=True)
+    else:
+        st.info("📷 Enable your camera and capture images for monitoring.")
 
 else:
     # ── Idle state ────────────────────────────────────────────────────────────
